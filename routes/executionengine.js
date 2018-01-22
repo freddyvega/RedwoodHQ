@@ -16,9 +16,11 @@ var nodemailer = require("nodemailer");
 var spawn = require('child_process').spawn;
 var os = require('os');
 var archiver = require('archiver');
+var elk = require('./elk');
 var db;
 var compilations = {};
 var fileSync = {};
+var ObjectID = require('mongodb').ObjectID;
 
 exports.stopexecutionPost = function(req, res){
     var execution = executions[req.body.executionID];
@@ -40,7 +42,12 @@ exports.stopexecutionPost = function(req, res){
     unlockMachines(execution.machines);
     unlockCloudMachines(execution.machines);
     for(var testcase in execution.currentTestCases){
-        updateExecutionTestCase({_id:execution.testcases[testcase]._id},{$set:{status:"Not Run","result":"",resultID:null,error:"",trace:"",startdate:"",enddate:"",runtime:""}});
+        if(execution.currentTestCases[testcase].testcase.dbTestCase.tcData && execution.currentTestCases[testcase].testcase.dbTestCase.tcData.length > 0){
+            updateExecutionTestCase({_id:execution.testcases[testcase]._id},{$set:{status:"Not Run","result":"",resultID:null,error:"",trace:"",startdate:"",enddate:"",runtime:""}});
+        }
+        else{
+            updateExecutionTestCase({_id:execution.testcases[testcase]._id},{$set:{status:"Not Run","result":"",resultID:null,error:"",trace:"",startdate:"",enddate:"",runtime:""}});
+        }
     }
     //git.deleteFiles(path.join(__dirname, '../public/automationscripts/'+req.cookies.project+"/"+req.cookies.username+"/build"),os.tmpDir()+"jar_"+req.body.executionID);
     deleteDir(os.tmpDir()+"/jar_"+req.body.executionID);
@@ -55,13 +62,47 @@ exports.stopexecutionPost = function(req, res){
     });
 };
 
-
 exports.startexecutionPost = function(req, res){
+    _startexecutionPost(req, res, function(exitcode){
+        console.log("+++++++++++++++++++++++++EXECUTIONS STARTED ++++++++++++++++++++++++++++++++++++++++++++++++")
+        var executionId = req.body.executionID;
+        MonitorExecution(executionId, function(){
+            // End the startexecution request
+            console.log('execution completed');
+            elk.publishDataToElk(executionId, function(){
+                console.log("Data published success: publishDataToElk");
+            });
+        });
+    });
+}
+
+function MonitorExecution(execId,callback){
+    db = common.getDB();
+    var getStatus = function(callback){
+        db.collection('executions', function(err, collection) {
+            collection.findOne({_id:execId}, {status:1}, function(err, dbexecution) {
+                callback(dbexecution.status);
+            });
+        });
+    };
+    var verifyStatus = function(status){
+        if(status == "Ready To Run"){
+            setTimeout(function(){callback()},10000);
+        }else{
+            setTimeout(function(){getStatus(verifyStatus)},10000)
+        }
+    };
+    setTimeout(function(){getStatus(verifyStatus)},20000)
+}
+
+var _startexecutionPost = function(req, res, callback){
     db = common.getDB();
 
+    res.contentType('json');
     if (req.body.testcases.length == 0){
-        res.contentType('json');
+        res.status(403);
         res.json({error:"No Test Cases are selected for execution."});
+        callback(0); // forbidden
         return;
     }
     var executionID =  req.body.executionID;
@@ -70,11 +111,13 @@ exports.startexecutionPost = function(req, res){
     var allScreenshots =  req.body.allScreenshots;
     var ignoreAfterState =  req.body.ignoreAfterState;
     var sendEmail =  req.body.sendEmail;
+    var sendEmailOnlyOnFailure = req.body.sendEmailOnlyOnFailure;
     var machines = req.body.machines;
     var variables = {};
     var testcases = req.body.testcases;
     var template = null;
-
+    var emails = req.body.emails;
+    console.log(req.body);
     //clean up previous files if needed
     /*
     for(var file in fileSync){
@@ -90,7 +133,10 @@ exports.startexecutionPost = function(req, res){
 
     var machineConflict = false;
     var updatingConflict = false;
+
     machines.forEach(function(machine){
+        machine.threads = (machine.threads) ? machine.threads : 1;
+        console.log("validating thread count " + machine.threads);
         if (machine.state == "Running Test"){
             machineConflict = true;
         }
@@ -101,36 +147,45 @@ exports.startexecutionPost = function(req, res){
     });
 
     if(machineConflict == true){
-        res.contentType('json');
+        console.log("selected machines are running tests +++++++++");
+        res.status(409);
         res.json({error:"Selected machines are currently running other tests."});
+        callback(0); // conflict
         return;
     }
 
     if(updatingConflict == true){
-        res.contentType('json');
+        console.log("selected machines are running tests 2 +++++++++");
+        res.status(409);
         res.json({error:"Selected machines are being updated."});
+        callback(0); // conflict
         return;
     }
 
     if(executions[executionID]){
+        console.log("selected machines are running tests 3 +++++++++");
         res.contentType('json');
+        res.status(409);
         res.json({error:"Execution is already running."});
+        callback(0); // conflict
         return;
     }
 
     if(req.body.templates){
         template = req.body.templates[0]
     }
-
-    executions[executionID] = {template:template,sendEmail:sendEmail,ignoreAfterState:ignoreAfterState,ignoreStatus:ignoreStatus,ignoreScreenshots:ignoreScreenshots,allScreenshots:allScreenshots,testcases:{},machines:machines,variables:variables,currentTestCases:{},project:req.cookies.project,username:req.cookies.username,returnVars:{}};
-    updateExecution({_id:executionID},{$set:{status:"Running"}},false);
+    executions[executionID] = {template:template,sendEmail:sendEmail,sendEmailOnlyOnFailure:sendEmailOnlyOnFailure,ignoreAfterState:ignoreAfterState,ignoreStatus:ignoreStatus,ignoreScreenshots:ignoreScreenshots,allScreenshots:allScreenshots,testcases:{},machines:machines,variables:variables,currentTestCases:{},project:req.cookies.project,username:req.cookies.username,returnVars:{},
+                               emails:emails};
+    updateExecution({_id:executionID},{$set:{status:"Running",user:req.cookies.username}},false);
 
     compileBuild(req.cookies.project,req.cookies.username,function(err){
         if (err != null){
             res.contentType('json');
+            res.status(403);
             res.json({error:"Unable to compile scripts."});
             updateExecution({_id:executionID},{$set:{status:"Ready To Run"}},true);
             delete executions[executionID];
+            callback(0); // forbidden
         }
         else{
             //copy files for each execution to prevent conflicts
@@ -143,16 +198,22 @@ exports.startexecutionPost = function(req, res){
                                 executions[executionID].sourceCache = sourceCache;
                             }
                             else{
+                                console.log("internal error +++++++++");
+                                /*res.status(500);
+                                res.json({error:"Internal Error"});*/
+                                callback(0);
                                 return;
                             }
                             verifyMachineState(machines,function(err){
                                 if(err){
+                                    console.error("verifymachinestate failed +++++++++");
                                     updateExecution({_id:executionID},{$set:{status:"Ready To Run"}},true);
-                                    res.contentType('json');
+                                    res.status(403);
                                     res.json({error:err});
                                     //git.deleteFiles(path.join(__dirname, '../public/automationscripts/'+req.cookies.project+"/"+req.cookies.username+"/build"),os.tmpDir()+"/jar_"+req.body.executionID);
                                     deleteDir(os.tmpDir()+"/jar_"+req.body.executionID);
                                     delete executions[executionID];
+                                    callback(0); // forbidden
                                     return;
                                 }
                                 VerifyCloudCapacity(executions[executionID].template,function(response){
@@ -164,12 +225,15 @@ exports.startexecutionPost = function(req, res){
                                         else{
                                             message = "Cloud does not have the capacity to run this execution."
                                         }
+                                        console.error("cloud error: failed +++++++++");
                                         updateExecution({_id:executionID},{$set:{status:"Ready To Run",cloudStatus:"Error: "+message}},true);
                                         res.contentType('json');
+                                        res.status(500);
                                         res.json({error:"Cloud Error: "+message});
                                         //git.deleteFiles(path.join(__dirname, '../public/automationscripts/'+req.cookies.project+"/"+req.cookies.username+"/build"),os.tmpDir()+"/jar_"+req.body.executionID);
                                         deleteDir(os.tmpDir()+"/jar_"+req.body.executionID);
                                         delete executions[executionID];
+                                        callback(0); //internal error
                                         return;
                                     }
                                     res.contentType('json');
@@ -188,6 +252,8 @@ exports.startexecutionPost = function(req, res){
                                                 //git.deleteFiles(path.join(__dirname, '../public/automationscripts/'+req.cookies.project+"/"+req.cookies.username+"/build"),os.tmpDir()+"/jar_"+req.body.executionID);
                                                 deleteDir(os.tmpDir()+"/jar_"+req.body.executionID);
                                                 delete executions[executionID];
+                                                console.error("startcloudmachine failed +++++++++");
+                                                callback(0); //elk
                                                 return;
                                             }
                                             if(executions[executionID].template){
@@ -196,7 +262,14 @@ exports.startexecutionPost = function(req, res){
                                             executions[executionID].machines = machines.concat(cloudMachines);
                                             getGlobalVars(executionID,function(){
                                                 testcases.forEach(function(testcase){
-                                                    executions[executionID].testcases[testcase.testcaseID] = testcase;
+                                                    testcase.dbID = testcase.testcaseID;
+                                                    if(testcase.tcData){
+                                                        testcase.testcaseID = testcase.testcaseID+testcase.rowIndex;
+                                                        executions[executionID].testcases[testcase.testcaseID] = testcase;
+                                                    }
+                                                    else{
+                                                        executions[executionID].testcases[testcase.testcaseID] = testcase;
+                                                    }
                                                 });
                                                 //see if there is a base state
                                                 suiteBaseState(executionID,executions[executionID].machines,function(){
@@ -210,6 +283,7 @@ exports.startexecutionPost = function(req, res){
                                             });
                                         });
                                     });
+                                    callback(0); // elk
                                 });
                             });
                         });
@@ -391,17 +465,17 @@ function applyMultiThreading(executionID,callback){
     var mainMachinesCount = executions[executionID].machines.length;
     executions[executionID].machines.forEach(function(machine){
         db.collection('machines', function(err, collection) {
-            collection.findOne({_id:db.bson_serializer.ObjectID(machine._id)}, {}, function(err, dbMachine) {
+            collection.findOne({_id:new ObjectID(machine._id)}, {}, function(err, dbMachine) {
                 var startThread = 0;
                 if(dbMachine){
                     startThread = dbMachine.takenThreads - machine.threads;
                 }
-                if(startThread != 0){
-                    startThread = dbMachine.lastStartThread + 1
-                }
+                //if(startThread != 0){
+                //    startThread = dbMachine.lastStartThread + 1
+                //}
 
-                collection.findAndModify({_id:db.bson_serializer.ObjectID(machine._id)},{},{$set:{lastStartThread:startThread}},{safe:true,new:true},function(err,data){
-                });
+                //collection.findAndModify({_id:new ObjectID(machine._id)},{},{$set:{lastStartThread:startThread}},{safe:true,new:true},function(err,data){
+                //});
                 common.logger.info("staring at:"+startThread);
                 machine.threadID = startThread;
                 //if more than one thread run base state if not let it go
@@ -474,8 +548,8 @@ function suiteBaseState(executionID,machines,callback){
                 collection.insert({baseState:true,name:machine.host+"_state",status:"Automated",type:"collection",collection:[{order:"1",actionid:machine.baseState,host:machine.host,executionflow:"Record Error Stop Test Case",parameters:[]}]}, {safe:true},function(err,testcaseData){
                     db.collection('executiontestcases', function(err, collection) {
                         //collection.save({_id:machine.resultID},{},{$set:{executionID:executionID,name:machine.host+"_state",status:"Not Run",testcaseID:testcaseData[0]._id.__id,_id: machine.resultID}}, {safe:true,new:true},function(err,returnData){
-                        collection.save({baseState:true,executionID:executionID,name:machine.host+"_state",status:"Not Run",testcaseID:testcaseData[0]._id.__id,_id: machine.baseStateTCID},function(err,returnData){
-                            suiteBaseTCs.push({testcaseID:testcaseData[0]._id.__id,retryCount:0,_id:machine.baseStateTCID,status:"Not Run",name:machine.host+"_state",type:"collection"});
+                        collection.save({baseState:true,executionID:executionID,name:machine.host+"_state",status:"Not Run",testcaseID:testcaseData[0]._id.toString(),_id: machine.baseStateTCID},function(err,returnData){
+                            suiteBaseTCs.push({testcaseID:testcaseData[0]._id.toString(),retryCount:0,_id:machine.baseStateTCID,status:"Not Run",name:machine.host+"_state",dbID:testcaseData[0]._id.toString(),type:"collection"});
                             count++;
                             lastMachine();
                         });
@@ -554,7 +628,13 @@ function executeTestCases(testcases,executionID){
                     });
                     updateExecution({_id:executionID},{$set:{status:"Ready To Run"}},true,function(){
                         executionsRoute.updateExecutionTotals(executionID,function(){
-                            if(executions[executionID].sendEmail == true) sendNotification(executionID);
+                            console.log(executions[executionID].sendEmail);
+                            console.log(executions[executionID].sendEmailOnlyOnFailure);
+                            if(executions[executionID] &&
+                               (executions[executionID].sendEmail === true || executions[executionID].sendEmailOnlyOnFailure === true) ) {
+                                console.log("sendNotification +++++++++++++++++ ")
+                                sendNotification(executionID, executions[executionID].sendEmailOnlyOnFailure);
+                            }
                             //git.deleteFiles(path.join(__dirname, '../public/automationscripts/'+executions[executionID].project+"/"+executions[executionID].username+"/build"),os.tmpDir()+"/jar_"+executionID);
                             deleteDir(os.tmpDir()+"/jar_"+executionID);
                             delete executions[executionID];
@@ -586,12 +666,20 @@ function executeTestCases(testcases,executionID){
                 if(shouldFinish == false) return;
                 unlockCloudMachines(executions[executionID].machines);
                 unlockMachines(executions[executionID].machines,function(){
+                    if(!executions[executionID]) return;
                     cleanUpMachines(executions[executionID].machines,executionID,function(){
 
                     });
                     updateExecution({_id:executionID},{$set:{status:"Ready To Run"}},true,function(){
                         executionsRoute.updateExecutionTotals(executionID,function(){
-                            if(executions[executionID] && executions[executionID].sendEmail == true) sendNotification(executionID);
+                            console.log(executions[executionID].sendEmail);
+                            console.log(executions[executionID].sendEmailOnlyOnFailure);
+
+                            if(executions[executionID] &&
+                               (executions[executionID].sendEmail === true || executions[executionID].sendEmailOnlyOnFailure === true) ) {
+                                console.log("sendNotification --------------------");
+                                sendNotification(executionID, executions[executionID].sendEmailOnlyOnFailure);
+                            }
                             //git.deleteFiles(path.join(__dirname, '../public/automationscripts/'+executions[executionID].project+"/"+executions[executionID].username+"/build"),os.tmpDir()+"/jar_"+executionID);
                             deleteDir(os.tmpDir()+"/jar_"+executionID);
                             delete executions[executionID];
@@ -635,7 +723,7 @@ function executeTestCases(testcases,executionID){
             return;
         }
         testcases[tcArray[count]].executing = true;
-        startTCExecution(testcases[tcArray[count]].testcaseID,variables,executionID,function(){
+        startTCExecution(testcases[tcArray[count]].testcaseID,testcases[tcArray[count]].dbID,variables,executionID,function(){
             if (!executions[executionID]) return;
             count++;
             var machineAvailable = false;
@@ -690,12 +778,16 @@ function executeTestCases(testcases,executionID){
     if (count == 0) nextTC();
 }
 
-function startTCExecution(id,variables,executionID,callback){
-    GetTestCaseDetails(id,executionID,function(testcase,result,hosts){
+function startTCExecution(id,dbID,variables,executionID,callback){
+    GetTestCaseDetails(id,dbID,executionID,function(testcase,result,hosts){
         if(testcase == null){
             callback();
             return;
         }
+        //if(executions[executionID].testcases[id].tcData && executions[executionID].testcases[id].tcData != ""){
+        //    testcase.tcData = executions[executionID].testcases[id].tcData;
+        //}
+        testcase.variables = {};
         testcase.machines = [];
         testcase.machineVars = [];
         var reservedHosts = [];
@@ -733,7 +825,24 @@ function startTCExecution(id,variables,executionID,callback){
         createResult(result,function(writtenResult){
             result._id = writtenResult[0]._id;
             result.executionID = executionID;
-            executions[executionID].currentTestCases[testcase.dbTestCase._id] = {testcase:testcase,result:result,executionTestCaseID:id};
+            if(executions[executionID].testcases[id].tcData && executions[executionID].testcases[id].tcData != ""){
+                result.tcData = executions[executionID].testcases[id].tcData;
+                result.rowIndex = executions[executionID].testcases[id].rowIndex;
+            }
+            if(!executions[executionID]) return;
+            executions[executionID].currentTestCases[id] = {testcase:testcase,result:result,executionTestCaseID:id};
+
+            for (var attrname in testcase.machineVars) { testcase.variables[attrname] = testcase.machineVars[attrname]; }
+            for (var attrname in variables) { testcase.variables[attrname] = variables[attrname]; }
+            if(result.rowIndex){
+                testcase.variables["Framework.TestCaseName"] = testcase.dbTestCase.name+"_"+result.rowIndex;
+            }
+            else{
+                testcase.variables["Framework.TestCaseName"] = testcase.dbTestCase.name;
+            }
+            if (result.tcData){
+                for (var tcDataColumn in result.tcData) { testcase.variables["TCData."+tcDataColumn] = result.tcData[tcDataColumn]; }
+            }
             //testcase.machines = [];
 
             testcase.startDate = new Date();
@@ -757,7 +866,7 @@ function startTCExecution(id,variables,executionID,callback){
                 result.result = error;
                 updateResult(result);
                 //executions[executionID].testcases[id].result = result;
-                finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[testcase.dbTestCase._id]);
+                finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[id]);
                 callback();
                 return;
             }
@@ -770,7 +879,7 @@ function startTCExecution(id,variables,executionID,callback){
                 result.status = "Finished";
                 result.result = "Passed";
                 updateResult(result);
-                finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[testcase.dbTestCase._id]);
+                finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[id]);
                 callback();
                 return;
             }
@@ -816,7 +925,7 @@ function startTCExecution(id,variables,executionID,callback){
                 result.status = "Finished";
                 result.result = "Failed";
                 updateResult(result);
-                finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[testcase.dbTestCase._id]);
+                finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[id]);
                 callback();
                 return;
             }
@@ -826,7 +935,8 @@ function startTCExecution(id,variables,executionID,callback){
 
             //var startTC = function(){
 
-            var agentInstructions = {command:"run action",executionID:executionID,testcaseID:testcase.dbTestCase._id,variables:executions[executionID].variables};
+            //var agentInstructions = {command:"run action",executionID:executionID,testcaseID:testcase.dbTestCase._id,variables:executions[executionID].variables};
+            var agentInstructions = {command:"run action",executionID:executionID,testcaseID:id,variables:executions[executionID].variables};
 
             var foundMachine = null;
 
@@ -838,9 +948,9 @@ function startTCExecution(id,variables,executionID,callback){
                         result.status = "Finished";
                         result.result = "Failed";
                         updateResult(result);
-                        if (executions[executionID] && executions[executionID].currentTestCases[testcase.dbTestCase._id]){
-                            executions[executionID].currentTestCases[testcase.dbTestCase._id].result = result;
-                            finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[testcase.dbTestCase._id]);
+                        if (executions[executionID] && executions[executionID].currentTestCases[id]){
+                            executions[executionID].currentTestCases[id].result = result;
+                            finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[id]);
                         }
                     }
                     else{
@@ -858,7 +968,7 @@ function startTCExecution(id,variables,executionID,callback){
                     result.result = "Failed";
                     updateResult(result);
                     //executions[executionID].testcases[id].result = result;
-                    finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[testcase.dbTestCase._id]);
+                    finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[id]);
                     return;
                 }
                 agentInstructions.name = testcase.name;
@@ -868,7 +978,7 @@ function startTCExecution(id,variables,executionID,callback){
                 agentInstructions.testcaseName = testcase.name;
                 agentInstructions.script = testcase.script;
                 agentInstructions.scriptLang = testcase.scriptLang;
-                agentInstructions.resultID = result._id.__id;
+                agentInstructions.resultID = result._id.toString();
                 agentInstructions.parameters = [];
                 agentInstructions.type = testcase.dbTestCase.type;
 
@@ -885,14 +995,14 @@ function startTCExecution(id,variables,executionID,callback){
                 executionsRoute.updateExecutionTotals(executionID);
                 if (foundMachine.runBaseState === true){
                     if (foundMachine.multiThreaded  == true){
-                        sendAgentCommand(foundMachine.host,foundMachine.port,agentInstructions,3);
+                        sendAgentCommand(foundMachine.host,foundMachine.port,agentInstructions,30);
                     }
                     else{
                         //make sure the files are actually there, in case of revert to snapshot or not persistent VMs files
                         //could have changed while test case was running
-                        sendAgentCommand(foundMachine.host,foundMachine.port,{command:"files loaded",executionID:executionID},3,function(message){
+                        sendAgentCommand(foundMachine.host,foundMachine.port,{command:"files loaded",executionID:executionID},30,function(message){
                             if (message.loaded == true){
-                                sendAgentCommand(foundMachine.host,foundMachine.port,agentInstructions,3);
+                                sendAgentCommand(foundMachine.host,foundMachine.port,agentInstructions,30);
                             }
                             else{
                                 runBaseState();
@@ -909,18 +1019,15 @@ function startTCExecution(id,variables,executionID,callback){
                 return;
             }
 
-            callback();
-            for (var attrname in testcase.machineVars) { variables[attrname] = testcase.machineVars[attrname]; }
-            variables["Framework.TestCaseName"] = testcase.dbTestCase.name;
-            findNextAction(testcase.actions,variables,function(action){
+            findNextAction(testcase.actions,testcase.variables,function(action){
                 if (!executions[executionID]) return;
-                if(!executions[executionID].currentTestCases[testcase.dbTestCase._id]) return;
+                if(!executions[executionID].currentTestCases[id]) return;
                 if(action == null){
-                    finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[testcase.dbTestCase._id]);
+                    finishTestCaseExecution(executions[executionID],executionID,executions[executionID].testcases[id]._id,executions[executionID].currentTestCases[id]);
                     return;
                 }
 
-                executions[executionID].currentTestCases[testcase.dbTestCase._id].currentAction = action;
+                executions[executionID].currentTestCases[id].currentAction = action;
 
                 agentInstructions.name = action.name;
                 agentInstructions.executionflow = action.dbAction.executionflow;
@@ -931,7 +1038,7 @@ function startTCExecution(id,variables,executionID,callback){
                 agentInstructions.testcaseName = testcase.dbTestCase.name;
                 agentInstructions.script = action.script;
                 agentInstructions.scriptLang = action.scriptLang;
-                agentInstructions.resultID = result._id.__id;
+                agentInstructions.resultID = result._id.toString();
                 agentInstructions.parameters = [];
                 action.dbAction.parameters.forEach(function(parameter){
                     agentInstructions.parameters.push({name:parameter.paramname,value:parameter.paramvalue});
@@ -945,24 +1052,24 @@ function startTCExecution(id,variables,executionID,callback){
                     }
                 });
 
-
+                callback();
                 agentInstructions.threadID = foundMachine.threadID;
                 updateExecutionTestCase({_id:executions[executionID].testcases[id]._id},{$set:{"status":"Running","result":"",error:"",trace:"",resultID:result._id,startdate:testcase.startDate,enddate:"",runtime:"",host:foundMachine.host,vncport:foundMachine.vncport}},foundMachine.host,foundMachine.vncport);
                 if ((testcase.machines.length > 0) &&((testcase.machines[0].baseState))){
-                    updateExecutionMachine(executionID,testcase.machines[0]._id,"",result._id.__id);
+                    updateExecutionMachine(executionID,testcase.machines[0]._id,"",result._id.toString());
                 }
                 executionsRoute.updateExecutionTotals(executionID);
 
                 if (foundMachine.runBaseState === true){
                     if (foundMachine.multiThreaded  == true){
-                        sendAgentCommand(foundMachine.host,foundMachine.port,agentInstructions,3);
+                        sendAgentCommand(foundMachine.host,foundMachine.port,agentInstructions,30);
                     }
                     else{
                         //make sure the files are actually there, in case of revert to snapshot or not persistent VMs files
                         //could have changed while test case was running
-                        sendAgentCommand(foundMachine.host,foundMachine.port,{command:"files loaded",executionID:executionID},3,function(message){
+                        sendAgentCommand(foundMachine.host,foundMachine.port,{command:"files loaded",executionID:executionID},30,function(message){
                             if (message.loaded == true){
-                                sendAgentCommand(foundMachine.host,foundMachine.port,agentInstructions,3);
+                                sendAgentCommand(foundMachine.host,foundMachine.port,agentInstructions,30);
                             }
                             else{
                                 runBaseState();
@@ -1001,12 +1108,14 @@ exports.logPost = function(req,res){
         realtime.emitMessage("AddExecutionLog",[req.body]);
     }
     res.contentType('json');
+    res.set('Connection','Close');
     res.json({success:true});
 };
 
 
 exports.actionresultPost = function(req, res){
     res.contentType('json');
+    res.set('Connection','Close');
     res.json({success:true});
 
     var execution = executions[req.body.executionID];
@@ -1027,6 +1136,7 @@ exports.actionresultPost = function(req, res){
         if (req.body.trace){
             formatTrace(req.body.trace,execution.sourceCache,function(trace){
                 testcase.result.trace = trace;
+                testcase.trace = trace;
                 if(trace == "") testcase.result.trace = req.body.trace;
                 updateResult(testcase.result);
             });
@@ -1038,17 +1148,20 @@ exports.actionresultPost = function(req, res){
         return;
     }
 
+    var actionFlow = testcase.currentAction.dbAction.executionflow;
     testcase.currentAction.result.status = "Finished";
+
     testcase.currentAction.result.result = req.body.result;
-    if(!testcase.result.error){
-        testcase.result.error = "";
-    }
-    if (req.body.error){
+    if (req.body.error && actionFlow != "Ignore Error Continue Test Case"){
         testcase.result.error = req.body.error;
         testcase.currentAction.result.error = req.body.error;
     }
 
-    if (req.body.trace){
+    if(!testcase.result.error){
+        testcase.result.error = "";
+    }
+
+    if (req.body.trace && actionFlow != "Ignore Error Continue Test Case"){
         testcase.result.trace = req.body.trace;
         testcase.currentAction.result.trace = req.body.trace;
         testcase.trace = req.body.trace;
@@ -1070,7 +1183,6 @@ exports.actionresultPost = function(req, res){
         //execution.variables[testcase.currentAction.dbAction.returnvalue] = req.body.returnValue;
     }
 
-    var actionFlow = testcase.currentAction.dbAction.executionflow;
     if (req.body.result == "Failed"){
         if (actionFlow == "Record Error Stop Test Case"){
             testcase.result.status = "Finished";
@@ -1099,17 +1211,14 @@ exports.actionresultPost = function(req, res){
             testcase.currentAction.result.result = "";
             testcase.currentAction.result.trace = "";
             testcase.currentAction.result.error = "";
-            testcase.result.result = "";
-            testcase.result.error = "";
+            //testcase.result.result = "";
+            //testcase.result.error = "";
         }
     }
 
-    markFinishedResults(testcase.result.children,execution.sourceCache,function(){
-        updateResult(testcase.result);
-    });
 
     var actionVariables = {};
-    for (var attrname in execution.variables) { actionVariables[attrname] = execution.variables[attrname]; }
+    for (var attrname in testcase.testcase.variables) { actionVariables[attrname] = testcase.testcase.variables[attrname]; }
     for (var attrname in testcase.machineVars) { actionVariables[attrname] = testcase.machineVars[attrname]; }
     if(execution.returnVars[testcase.executionTestCaseID]){
         for (var attrname in execution.returnVars[testcase.executionTestCaseID]) { actionVariables[attrname] = execution.returnVars[testcase.executionTestCaseID][attrname]; }
@@ -1119,9 +1228,16 @@ exports.actionresultPost = function(req, res){
         if(action == null){
             testcase.result.status = "Finished";
             if(testcase.result.result != "Failed") testcase.result.result = "Passed";
-            updateResult(testcase.result);
+            markFinishedResults(testcase.result.children,execution.sourceCache,function(){
+                updateResult(testcase.result);
+            });
             finishTestCaseExecution(execution,req.body.executionID,execution.testcases[testcase.executionTestCaseID]._id,testcase);
             return;
+        }
+        else{
+            markFinishedResults(testcase.result.children,execution.sourceCache,function(){
+                updateResult(testcase.result);
+            });
         }
 
         var foundMachine = null;
@@ -1136,9 +1252,9 @@ exports.actionresultPost = function(req, res){
         updateExecutionTestCase({_id:execution.testcases[testcase.executionTestCaseID]._id},{$set:{"status":"Running","result":"",host:foundMachine.host,vncport:foundMachine.vncport}},foundMachine.host,foundMachine.vncport);
         testcase.result.status = "Running";
 
-        var agentInstructions = {command:"run action",executionID:req.body.executionID,threadID:foundMachine.threadID,testcaseID:testcase.testcase.dbTestCase._id,variables:execution.variables};
+        var agentInstructions = {command:"run action",executionID:req.body.executionID,threadID:foundMachine.threadID,testcaseID:testcase.executionTestCaseID,variables:testcase.testcase.variables};
 
-        execution.currentTestCases[testcase.testcase.dbTestCase._id].currentAction = action;
+        execution.currentTestCases[testcase.executionTestCaseID].currentAction = action;
 
         agentInstructions.name = action.name;
         agentInstructions.executionflow = action.dbAction.executionflow;
@@ -1149,7 +1265,7 @@ exports.actionresultPost = function(req, res){
         agentInstructions.testcaseName = testcase.testcase.dbTestCase.name;
         agentInstructions.script = action.script;
         agentInstructions.scriptLang = action.scriptLang;
-        agentInstructions.resultID = testcase.result._id.__id;
+        agentInstructions.resultID = testcase.result._id.toString();
         agentInstructions.parameters = [];
         action.dbAction.parameters.forEach(function(parameter){
             agentInstructions.parameters.push({name:parameter.paramname,value:parameter.paramvalue});
@@ -1164,8 +1280,8 @@ exports.actionresultPost = function(req, res){
                     testcase.result.result = "Failed";
                     updateResult(testcase.result);
                     if (execution && testcase.dbTestCase){
-                        execution.currentTestCases[testcase.dbTestCase._id].result = "Failed";
-                        finishTestCaseExecution(execution,req.body.executionID,execution.testcases[id]._id,execution.currentTestCases[testcase.dbTestCase._id]);
+                        execution.currentTestCases[testcase.executionTestCaseID].result = "Failed";
+                        finishTestCaseExecution(execution,req.body.executionID,execution.testcases[id]._id,execution.currentTestCases[testcase.executionTestCaseID]);
                     }
                 }
                 else{
@@ -1211,13 +1327,13 @@ function finishTestCaseExecution(execution,executionID,testcaseId,testcase){
         status = "Not Run";
     }
     var updateTC = function(){
-        updateExecutionTestCase({_id:testcaseId},{$set:{trace:testcase.trace,"status":status,resultID:testcase.result._id.__id,result:testcase.result.result,error:testcase.result.error,enddate:date,runtime:date-testcase.testcase.startDate,host:"",vncport:""}});
+        updateExecutionTestCase({_id:testcaseId},{$set:{trace:testcase.trace,"status":status,resultID:testcase.result._id.toString(),result:testcase.result.result,error:testcase.result.error,enddate:date,runtime:date-testcase.testcase.startDate,host:"",vncport:""}});
         executionsRoute.updateExecutionTotals(executionID);
     };
     //update machine base state result
     if(execution.cachedTCs){
         if (testcase.testcase.machines.length > 0){
-            updateExecutionMachine(executionID,testcase.testcase.machines[0]._id,testcase.result.result,testcase.result._id.__id,function(){
+            updateExecutionMachine(executionID,testcase.testcase.machines[0]._id,testcase.result.result,testcase.result._id.toString(),function(){
                 updateTC();
             });
         }
@@ -1262,9 +1378,9 @@ function finishTestCaseExecution(execution,executionID,testcaseId,testcase){
                 execution.testcases[testcase.executionTestCaseID].executing = false;
             }
             delete execution.currentTestCases[testcase.executionTestCaseID];
-            if(execution.executingTCs != true){
+            //if(execution.executingTCs != true){
                 executeTestCases(execution.testcases,executionID);
-            }
+            //}
         }
     });
 }
@@ -1408,14 +1524,14 @@ exports.agentBaseState = function(project,executionID,agentHost,port,threadID,ca
 
 function agentBaseState(project,executionID,agentHost,port,threadID,callback){
     sendAgentCommand(agentHost,port,{command:"cleanup",executionID:executionID},3,function(message){
-        if (message.error){
+        if (message && message.error){
             callback(message);
             return;
         }
         if(executions[executionID]){
             executions[executionID].fileReqs = [];
         }
-        else{
+        else if(executionID.indexOf("unittest") == -1){
             return;
         }
         //os.tmpDir()+"/jar_"+executionID
@@ -1564,15 +1680,20 @@ function matchFileWithAgent(file,dest,agentHost,port,retryCount,callback){
             }
         });
     });
-    req.on('error', function(e) {
+
+    var retryMatch = function(message){
         if(retryCount <= 0){
-            if (callback) callback("Unable to connect to machine: "+agentHost + " error: " + e.message);
-            common.logger.error('matchFileWithAgent problem with request: ' + e.message+ ' ');
+            if (callback) callback("Unable to connect to machine: "+agentHost + " error: " + message);
+            common.logger.error('matchFileWithAgent problem with request: ' + message+ ' ');
         }
         else{
             retryCount--;
             setTimeout(matchFileWithAgent(file,dest,agentHost,port,retryCount,callback),1000)
         }
+    };
+
+    req.on('error', function(e) {
+        retryMatch(e.message)
     });
     //fs.readFile(file, function(err, buf) {
         // write data to request body
@@ -1586,7 +1707,7 @@ function matchFileWithAgent(file,dest,agentHost,port,retryCount,callback){
 
     s.on('error',function(err){
         s.destroy.bind(s);
-        s.end();
+        retryMatch("Unable to read file:"+file)
     });
 
     s.on('close',function(){
@@ -1660,6 +1781,7 @@ function sendFileToAgent(file,dest,agentHost,port,retryCount,executionID,callbac
         var req = http.request(options, function(res) {
             //res.setEncoding('utf8');
             res.on('data', function (chunk) {
+                readStream.destroy();
                 if (file in fileSync){
                     if(fileSync[file].close){
                         fileSync[file].destroy();
@@ -1677,11 +1799,12 @@ function sendFileToAgent(file,dest,agentHost,port,retryCount,executionID,callbac
             });
         });
 
-        if( executions[executionID && executions[executionID].fileReqs]){
+        if( executions[executionID] && executions[executionID].fileReqs){
             executions[executionID].fileReqs.push(req);
         }
 
         var handleError = function(e){
+            readStream.destroy();
             if(file in fileSync && fileSync[file].close){
                 fileSync[file].destroy();
             }
@@ -1716,7 +1839,7 @@ function sendFileToAgent(file,dest,agentHost,port,retryCount,executionID,callbac
             }
             catch(e){
                 //req.end();
-                readStream.end();
+                readStream.destroy();
             }
         });
         readStream.on('close',function(){
@@ -1787,12 +1910,38 @@ function sendAgentCommand(agentHost,port,command,retryCount,callback){
 
 function resolveParamValue(value,variables){
     var returnNULL = false;
+
+    var resolveVariable = function(stringValue){
+        return stringValue.replace(new RegExp("\\$\\{([\\s\\w_.-]+)\\}", "g" ),function(a,b){
+            if(b in variables){
+                if (variables[b] == "<NULL>"){
+                    if (returnNULL == true){
+                        return "<NULL>"
+                    }
+                    else{
+                        return "";
+                    }
+                }
+                else{
+                    return variables[b];
+                }
+            }
+            else{
+                return a;
+            }
+        });
+    };
+
     if(Object.prototype.toString.call(value) == '[object Array]'){
         if((value.length == 1) && (value[0] === "<NULL>")){
             return [];
         }
         else{
-            return value;
+            var returnValue = [];
+            value.forEach(function(arrayItem){
+                returnValue.push(resolveVariable(arrayItem))
+            });
+            return returnValue;
         }
     }
     else if (typeof value != "string"){
@@ -1805,31 +1954,12 @@ function resolveParamValue(value,variables){
             returnNULL = true;
         }
     }
-    //var result = value.replace(new RegExp("\\$\\{([\\w_.-\\s*]+)\\}", "g" ),function(a,b){
-    var result = value.replace(new RegExp("\\$\\{([\\s\\w_.-]+)\\}", "g" ),function(a,b){
-        if(b in variables){
-            if (variables[b] == "<NULL>"){
-                if (returnNULL == true){
-                    return "<NULL>"
-                }
-                else{
-                    return "";
-                }
-            }
-            else{
-                return variables[b];
-            }
-        }
-        else{
-            return a;
-        }
-    });
-    return result;
+    return resolveVariable(value);
 }
 
 function createResult(result,callback){
     db.collection('testcaseresults', function(err, collection) {
-        result._id = db.bson_serializer.ObjectID(result._id);
+        result._id = new ObjectID(result._id);
         collection.insert(result, {safe:true},function(err,returnData){
             callback(returnData);
         });
@@ -1839,12 +1969,13 @@ function createResult(result,callback){
 
 function updateResult(result,callback){
     db.collection('testcaseresults', function(err, collection) {
-        collection.save(result,{safe:true},function(err){
+        collection.save(result,{safe:true},function(err,data){
+            if(err) common.logger.error("ERROR updating results: "+err);
             if (callback){
                 callback(err);
             }
             //realtime.emitMessage("UpdateResult",result);
-            realtime.emitMessage("UpdateResult"+result._id.__id,result);
+            realtime.emitMessage("UpdateResult"+result._id.toString(),result);
         });
     });
 }
@@ -1852,6 +1983,7 @@ function updateResult(result,callback){
 function updateExecutionTestCase(query,update,machineHost,vncport,callback){
     db.collection('executiontestcases', function(err, collection) {
         collection.findAndModify(query,{},update,{safe:true,new:true},function(err,data){
+            if(err) common.logger.error("ERROR updating results: "+err.message);
             if (data == null){
                 if (callback){
                     callback(err);
@@ -1873,9 +2005,14 @@ function updateExecutionTestCase(query,update,machineHost,vncport,callback){
 function updateExecution(query,update,finished,callback){
     db.collection('executions', function(err, collection) {
         collection.findAndModify(query,{},update,{safe:true,new:true},function(err,data){
-            if(err) common.logger.error("ERROR updating execution: "+err);
+            if(err) {
+                common.logger.error("ERROR updating execution: "+err.message);
+                return;
+            }
             realtime.emitMessage("UpdateExecutions",data);
             if(finished === true){
+                console.log("FinishExecution +++++++++++++++ ");
+                //console.log(data);
                 realtime.emitMessage("FinishExecution",data);
             }
             if (callback){
@@ -1933,8 +2070,8 @@ function verifyMachineState(machines,callback){
     if(machines.length == 0 && callback) callback();
     machines.forEach(function(machine){
         db.collection('machines', function(err, collection) {
-            collection.findOne({_id:db.bson_serializer.ObjectID(machine._id)}, {}, function(err, dbMachine) {
-
+            collection.findOne({_id:new ObjectID(machine._id)}, {}, function(err, dbMachine) {
+                //console.log("verifyMachineState : " + machine.threads );
                 if(dbMachine.maxThreads < dbMachine.takenThreads + machine.threads)
                 {
                     callback("Machine: "+ machine.host+" has reached thread limit.");
@@ -2090,7 +2227,7 @@ function lockMachines(machines,executionID,callback){
     machines.forEach(function(machine){
         updateExecutionMachine(executionID,machine._id,"","");
         db.collection('machines', function(err, collection) {
-            collection.findOne({_id:db.bson_serializer.ObjectID(machine._id)}, {}, function(err, dbMachine) {
+            collection.findOne({_id:new ObjectID(machine._id)}, {}, function(err, dbMachine) {
                 if(dbMachine.maxThreads < dbMachine.takenThreads + machine.threads)
                 {
                     callback("Machine: "+ machine.host+" has reached thread limit.");
@@ -2104,7 +2241,7 @@ function lockMachines(machines,executionID,callback){
                     else{
                         takenThreads = machine.threads;
                     }
-                    updateMachine({_id:db.bson_serializer.ObjectID(machine._id)},{$set:{takenThreads:takenThreads,state:"Running "+takenThreads+ " of " + machine.maxThreads}},function(){
+                    updateMachine({_id:new ObjectID(machine._id)},{$set:{takenThreads:takenThreads,state:"Running "+takenThreads+ " of " + machine.maxThreads}},function(){
                         machineCount++;
                         if (machineCount == machines.length){
                             if(callback) callback();
@@ -2158,7 +2295,7 @@ function unlockMachines(allmachines,callback){
     unlockCloudMachines(allmachines);
     var nextMachine = function(){
         db.collection('machines', function(err, collection) {
-            collection.findOne({_id:db.bson_serializer.ObjectID(machines[machineCount]._id)}, {}, function(err, dbMachine) {
+            collection.findOne({_id:new ObjectID(machines[machineCount]._id)}, {}, function(err, dbMachine) {
                 common.logger.info(dbMachine);
                 if(dbMachine != null) {
                     var takenThreads = 1;
@@ -2173,7 +2310,7 @@ function unlockMachines(allmachines,callback){
                     if (takenThreads > 0) state = "Running "+takenThreads+ " of " + dbMachine.maxThreads;
 
                     updateMachine({_id:dbMachine._id},{$set:{takenThreads:takenThreads,state:state}},function(){
-                    //updateMachine({_id:db.bson_serializer.ObjectID(dbMachine._id)},{$set:{takenThreads:takenThreads,state:state}},function(){
+                    //updateMachine({_id:new ObjectID(dbMachine._id)},{$set:{takenThreads:takenThreads,state:state}},function(){
                         machineCount++;
                         if (machineCount == machines.length){
                             if(callback) callback();
@@ -2294,9 +2431,13 @@ function findNextAction (actions,variables,callback){
 }
 
 
-function deleteOldResult(testcaseID,executionID,callback){
+function deleteOldResult(resultID,executionID,callback){
+    if(!resultID) {
+        if(callback) callback();
+        return;
+    }
     db.collection('testcaseresults', function(err, collection) {
-        collection.findOne({testcaseID:db.bson_serializer.ObjectID(testcaseID),executionID:executionID}, {}, function(err, result) {
+        collection.findOne({_id:new ObjectID(resultID),executionID:executionID}, {}, function(err, result) {
             if(result == null) {
                 if(callback) callback();
                 return;
@@ -2317,7 +2458,7 @@ function deleteOldResult(testcaseID,executionID,callback){
 }
 
 
-function GetTestCaseDetails(testcaseID,executionID,callback){
+function GetTestCaseDetails(testcaseID,dbID,executionID,callback){
     var testcaseDetails = {};
     var testcaseResults = {};
     var hosts = [];
@@ -2328,7 +2469,7 @@ function GetTestCaseDetails(testcaseID,executionID,callback){
                 cb();
                 return;
             }
-            collection.findOne({_id:db.bson_serializer.ObjectID(nextAction.actionid)}, {}, function(err, action) {
+            collection.findOne({_id:new ObjectID(nextAction.actionid)}, {}, function(err, action) {
                 if(action == null){
                     cb();
                     return;
@@ -2346,7 +2487,7 @@ function GetTestCaseDetails(testcaseID,executionID,callback){
                 lastResultPoint.name = action.name;
                 lastResultPoint.actionStatus = action.status;
                 if (action.status != "Automated"){
-                    if (executions[executionID].ignoreStatus != true){
+                    if (executions[executionID] && executions[executionID].ignoreStatus != true){
                         testcaseDetails.statusError = "One ore more actions inside the test case are not in automated state.";
                         lastResultPoint.error = "Action " + action.status;
                     }
@@ -2394,14 +2535,13 @@ function GetTestCaseDetails(testcaseID,executionID,callback){
         });
     };
 
-    deleteOldResult(testcaseID,executionID,function(){
+    deleteOldResult(executions[executionID].testcases[testcaseID].resultID,executionID,function(){
         db.collection('testcases', function(err, collection) {
-            collection.findOne({_id:db.bson_serializer.ObjectID(testcaseID)}, {}, function(err, testcase) {
+            collection.findOne({_id:new ObjectID(dbID)}, {}, function(err, testcase) {
                 if(testcase == null) {
                     callback(null);
                     return;
                 }
-                //if (testcase.type == "script"){
                 if (testcase.type == "script" ||testcase.type == "junit"||testcase.type == "testng"){
                     var lang = "Java/Groovy";
                     if(testcase.scriptLang){
@@ -2415,9 +2555,22 @@ function GetTestCaseDetails(testcaseID,executionID,callback){
                     //now process after state
                     var afterStatePresent = false;
                     if((testcase.afterState) && (testcase.afterState != "") &&(executions[executionID].ignoreAfterState == false)){
-                        afterStatePresent = true;
-                        var stateOrder = (testcase.collection.length+1).toString();
-                        testcase.collection.push({order:stateOrder,host:"Default",actionid:testcase.afterState,parameters:[],executionflow:"Record Error Stop Test Case",afterState:true});
+                        var stateOrder = (testcase.collection.length+1);
+                        if(Array.isArray(testcase.afterState)){
+                            if(testcase.afterState.length > 0){
+                                afterStatePresent = true;
+                            }
+                            testcase.afterState.forEach(function(afterStateAction,index){
+                                var afterStateActionOrder = stateOrder+index;
+                                afterStateAction.order = afterStateActionOrder.toString();
+                                afterStateAction.afterState = true;
+                                testcase.collection.push(afterStateAction);
+                            })
+                        }
+                        else{
+                            afterStatePresent = true;
+                            testcase.collection.push({order:stateOrder.toString(),host:"Default",actionid:testcase.afterState,parameters:[],executionflow:"Record Error Stop Test Case",afterState:true});
+                        }
                     }
                     if (testcase.collection.length > 0){
                         testcaseDetails = {dbTestCase:testcase,actions:[],afterState:afterStatePresent};
@@ -2434,7 +2587,7 @@ function GetTestCaseDetails(testcaseID,executionID,callback){
 
                             var runAction = true;
 
-                            if(!executions[executionID]){
+                            if(!executions[executionID] || !executions[executionID].testcases[testcaseID]){
                                 return;
                             }
                             //if start action is greater than all actions don't execute anything
@@ -2473,15 +2626,287 @@ function GetTestCaseDetails(testcaseID,executionID,callback){
         })
     });
 }
+function _generateEmailReport(settings, execution, callback) {
+    var body = '';
+    //settings.serverHost = 'localhost'; // temp
 
-function sendNotification(executionID){
+    // 1. "Test Execution Summary:"
+    function _formTestExecutionSummaryReport() {
+        if(!execution) return '';
+        var str = '<h2>Execution Summary:</h2><p></p><p><table border="1" cellpadding="3">' +
+            '<tr>' +
+            '<th><b>Total </b></th>' +
+            '<td><b>'+execution.total+ " " +'</b></td>' +
+            '</tr>' +
+            '<tr>' +
+                '<th>Passed </th>' +
+                '<td style="color:green">'+execution.passed + " "+'</td>' +
+            '</tr>' +
+            '<tr>' +
+                '<th>Failed </th>' +
+                '<td style="color:red">'+execution.failed+ " " +'</td>' +
+            '</tr>' +
+            '<tr>' +
+                '<th>Not Run </th>' +
+                '<td style="color:#ffb013">'+execution.notRun + " " + '</td>' +
+            '</tr>' +
+        '</table></p>';
+
+        return str;
+    }
+
+    /*function _getMachinesAsString() {
+        if(!execution || !execution.machines || execution.machines.length < 1) return '';
+        var str = '';
+        for(var i = 0; i < execution.machines.length; i++) {
+            str += " " + execution.machines[i].host + ':' + execution.machines[i].port + '<br>';
+        }
+        return str;
+    }*/
+
+    // 2. "Execution Details:"
+    function _formExecutionDetailsReport() {
+        if(!execution) return '';
+        var str =  '<h2>Execution Details:</h2><p></p>' +
+            '<p><table border="1" cellpadding="3">' +
+                '<tr>' +
+                    '<th>User </th>' +
+                    '<td>'+execution.user+" "+'</td>' +
+                '</tr>' +
+                /*'<tr>' +
+                    '<th>Machines </th>' +
+                    '<td>'+_getMachinesAsString()+" "+'</td>' +
+                '</tr>' + */
+                '<tr>' +
+                    '<th>Project </th>' +
+                    '<td>'+execution.project+" "+'</td>' +
+                '</tr>' +
+                '<tr>' +
+                    '<th>Test Suite Name </th>' +
+                    '<td>'+execution.testsetname+" "+'</td>' +
+                '</tr>' +
+            '</table></p>';
+
+        return str;
+    }
+
+    // 3. "Execution Variable Details:"
+    function _formExecutionVariablesDetailsReport() {
+        if(!execution || !execution.variables || execution.variables.length < 1) return '';
+
+        var str = '<h2>Execution Variable Details:</h2><p></p>' +
+                    '<p><table border="1" cellpadding="3">' +
+                        '<tr>' +
+                            '<th><b>Name </b></th>' +
+                            '<th><b>Value </b></th>' +
+                        '</tr>';
+        for(var i = 0; i < execution.variables.length; i++) {
+            str += '<tr>' +
+                        '<td>'+ execution.variables[i].name + " " +'</td>' +
+                        '<td>'+ execution.variables[i].value + " " +'</td>' +
+                    '</tr>';
+        }
+
+        str += '</table></p>';
+        return str;
+    }
+
+    function _getParametersAsString(parameters){
+        if(!parameters || parameters.length < 1) return '';
+        var str = '';
+        for(var i = 0; i < parameters.length; i++) {
+            str += "<b>" + parameters[i].paramname + '</b> = ' + parameters[i].paramvalue + '<br>';
+        }
+        return str;
+    }
+
+    // 4. "Testcase Results Summary "
+    function _formTestcaseResultsSummaryReport(callbackFunc) {
+        var str = '';
+        var rows = '';
+        console.log("_formTestcaseResultsSummaryReport +1")
+        db.collection('testcaseresults', function(err, collection) {
+            console.log("_formTestcaseResultsSummaryReport +2")
+            collection.find({executionID:execution._id}, {}, function(err, cursor) {
+                console.log("_formTestcaseResultsSummaryReport +3")
+                if(!cursor || err) return '<p>form Testcase Results Summary Report failed</p>';
+                console.log("_formTestcaseResultsSummaryReport +4")
+
+                str += '<h2>Test Case Summary:</h2>';
+                str +=   '</p>' +
+                          '<p><table border="1" cellpadding="3">' +
+                            '<tr>' +
+                                '<th><b>Name </b></th>' +
+                                '<th><b>Status </b></th>' +
+                                '<th><b>Result </b></th>' +
+                            '</tr>';
+
+                cursor.each(function(err, testcaseresult) {
+                    console.log("_formTestcaseResultsSummaryReport +5")
+                    if(testcaseresult) {
+                        console.log("_formTestcaseResultsSummaryReport +6")
+
+                        console.log( "DATA => " + testcaseresult.name + testcaseresult.status + testcaseresult.result);
+                        var row = '<tr>' +
+                                    '<td>'+ testcaseresult.name + ' </td>';
+                        if(testcaseresult.status === 'Finished') {
+                            row +=  '<td><b style="color:green">' + testcaseresult.status + ' </b></td>';
+                        } else {
+                            row +=  '<td><b style="color:orange">' + testcaseresult.status + ' </b></td>';
+                        }
+                        if(testcaseresult.result === 'Passed') {
+                            row +=  '<td><b style="color:green">' + testcaseresult.result + ' </b></td>';
+                        } else if(testcaseresult.result === 'Failed') {
+                            row +=  '<td><b style="color:red">' + testcaseresult.result + ' </b></td>';
+                        } else {
+                            row +=  '<td><b>' + testcaseresult.result + ' </b></td>';
+                        }
+                        row += '</tr>';
+                        rows += row;
+                    } else {
+                        console.log("_formTestcaseResultsSummaryReport +7")
+                        str += rows + '</table></p>';
+                        console.log(str);
+                        callbackFunc(str);
+                    }
+                    console.log("_formTestcaseResultsSummaryReport +9")
+                });
+
+            });
+        });
+
+    }
+
+    function _prepareTestResultRow(rowData, addOrderColumnData) {
+        var row = '';
+        row += '<tr>' +
+                    '<td>'+ function() { return (addOrderColumnData) ? rowData.order : '' }() + '</td>' +
+                    '<td>'+ rowData.name + '</td>' +
+                    '<td>'+ _getParametersAsString(rowData.parameters) +'</td>';
+        if(rowData.status === 'Finished') {
+            row +=  '<td style="color:green"><b>'+ rowData.status +'</b></td>';
+        } else { // Not run
+            row +=  '<td style="color:orange"><b>'+ rowData.status +'</b></td>';
+        }
+        if(rowData.result === 'Passed') {
+            row +=  '<td style="color:green"><b>'+ rowData.result +'</b></td>';
+        } else if(rowData.result === 'Failed') {
+            row +=  '<td style="color:red"><b>'+ rowData.result +'</b></td>';
+        } else {
+            row +=  '<td></td>';
+        }
+            row +=  '<td style="color:red">'+ function() { return (rowData.error) ? rowData.error : '' }() +'</td>';
+        if(rowData.screenshot) {
+            row +=  '<td>'+ "<a href='http://" + settings.serverHost + ":" + common.Config.AppServerPort + "/screenshots/" + rowData.screenshot + "'>view</a>" + '</td>';
+        }else {
+            row +=  '<td></td>';
+        }
+            row +=  '<td style="color:red">'+ function() { return (rowData.trace) ? rowData.trace : ''}() +'</td>' +
+                '</tr>';
+
+        return row;
+    }
+
+    // 5. "TestCase Results:"
+    function _formTestResultsReport(callbackFunc) {
+        var str = '';
+       // console.log("_formTestResultsReport +1")
+        db.collection('testcaseresults', function(err, collection) {
+           // console.log("_formTestResultsReport +2")
+            collection.find({executionID:execution._id}, {}, function(err, cursor) {
+                //console.log("_formTestResultsReport +3")
+                if(!cursor || err) return '<p>_formTestResultsReport failed</p>';
+                //console.log("_formTestResultsReport +4")
+
+                str += '<h2>Test Case Results:</h2>';
+                cursor.each(function(err, testcaseresult) {
+                    //console.log("_formTestResultsReport +5")
+                    if(testcaseresult) {
+                        //console.log("_formTestResultsReport +6")
+
+                        str +=   '<p>' + '<div><b>Name: </b>' + testcaseresult.name + '</div>';
+                        if(testcaseresult.status === 'Finished') {
+                            str +=  '<div><b>Status: </b><b style="color:green">' + testcaseresult.status + '</b></div>';
+                        } else {
+                           str +=  '<div><b>Status: </b><b style="color:orange">' + testcaseresult.status + '</b></div>';
+                        }
+                        if(testcaseresult.result === 'Passed') {
+                            str +=  '<div><b>Result: </b><b style="color:green">' + testcaseresult.result + '</b></div>';
+                        } else if(testcaseresult.result === 'Failed') {
+                            str +=  '<div><b>Result: </b><b style="color:red">' + testcaseresult.result + '</b></div>';
+                        } else {
+                            str +=  '<div><b>Result: </b>' + testcaseresult.result + '</div>';
+                        }
+                        str +=   '</p>' +
+                                  '<p><table border="1" cellpadding="3">' +
+                                    '<tr>' +
+                                        '<th><b>Test Step</b></th>' +
+                                        '<th><b>Action Name</b></th>' +
+                                        '<th><b>Parameters</b></th>' +
+                                        '<th><b>Status</b></th>' +
+                                        '<th><b>Result</b></th>' +
+                                        '<th><b>Error</b></th>' +
+                                        '<th><b>Screenshot</b></th>' +
+                                        '<th><b>Trace</b></th>' +
+                                    '</tr>';
+                        if(!err && testcaseresult.children){ // success
+                            //console.log("_formTestResultsReport +7")
+                            console.log(testcaseresult.children);
+                            var rows = '';
+                            for(var i = 0; i < testcaseresult.children.length; i++) {
+                                //console.log("_formTestResultsReport +8" + i)
+                                rows += _prepareTestResultRow(testcaseresult.children[i], true);
+
+                                // attach nested child report
+                                var grandChild = testcaseresult.children[i].children;
+                                if(grandChild) {
+                                    for(var j = 0; j < grandChild.length; j++) {
+                                       // console.log("_formTestResultsReport GRANDCHILD+8" + j)
+                                        rows += _prepareTestResultRow(grandChild[j], false);
+                                    }
+                                }
+                            }
+                            str += rows + '</table></p><br>';
+                        }
+                    }else {
+                        //console.log("_formTestResultsReport +9")
+                        callbackFunc(str);
+                    }
+                   // console.log("_formTestResultsReport +10")
+                });
+            });
+        });
+    }
+
+    var body = "<p><style>tr:nth-child(odd) {background-color: #b8d1f3;} tr:nth-child(even){ background: #dae5f4;} th { background-color: #3f8fdf; color: white; } th,td { padding: 0.25rem; text-align: left; border: 0px solid #000000;}</style>" +
+                  "<a href='http://" + settings.serverHost+ ":" + common.Config.AppServerPort + "/index.html?execution=" + execution._id + "&project=" + execution.project + "'>Execution: " + execution.name + "</a></p>";
+
+    body = body + _formTestExecutionSummaryReport()
+                + _formExecutionDetailsReport()
+                + _formExecutionVariablesDetailsReport();
+
+    _formTestcaseResultsSummaryReport(function(summStr) {
+        body += summStr;
+        _formTestResultsReport(function(str) {
+            body += str;
+            callback(body);
+        });
+    });
+}
+function sendNotification(executionID, sendEmailOnlyOnFailure){
+   // console.log("sendNotification +1");
     db.collection('emailsettings', function(err, collection) {
+        //console.log("sendNotification +2");
         db.collection('executions', function(err, EXEcollection) {
+            //console.log("sendNotification +3");
             collection.findOne({}, {}, function(err, settings) {
+                //console.log("sendNotification +4");
                 EXEcollection.findOne({_id:executionID}, {}, function(err, execution) {
-                    if(!execution.emails) return;
-                    if(execution.emails.length == 0) return;
-                    if((!settings.host) || (settings.host == "")) return;
+                    //console.log("sendNotification +5");
+                    if(!execution.emails || execution.emails.length == 0) return;
+                    //console.log("sendNotification +6");
+                    if((settings == null) || (!settings.host) || (settings.host == "")) return;
+                    //console.log("sendNotification +7");
                     var options = {};
 
                     var subject = "Execution FINISHED: " + execution.name;
@@ -2490,62 +2915,56 @@ function sendNotification(executionID){
                     }
                     else{
                         subject = subject + " (ALL PASSED)"
+                        //console.log(sendEmailOnlyOnFailure);
+                        if(sendEmailOnlyOnFailure === true) {
+                            // Send email notification only when execution failed
+                            console.log("Donot send email!!!")
+                            return;
+                        }
                     }
 
-                    var body = "<p><a href='http://" + settings.serverHost+ ":" + common.Config.AppServerPort + "/index.html?execution=" + execution._id + "&project=" + execution.project + "'>Execution: " + execution.name + "</a></p>";
-
-                    body = body + '<p><table border="1" cellpadding="3">' +
-                        '<tr>' +
-                        '<td><b>Total</b></td>' +
-                        '<td><b>'+execution.total+'</b></td>' +
-                        '</tr>' +
-                        '<tr>' +
-                            '<td>Passed</td>' +
-                            '<td style="color:green">'+execution.passed+'</td>' +
-                        '</tr>' +
-                        '<tr>' +
-                            '<td>Failed</td>' +
-                            '<td style="color:red">'+execution.failed+'</td>' +
-                        '</tr>' +
-                        '<tr>' +
-                            '<td>Not Run</td>' +
-                            '<td style="color:#ffb013">'+execution.notRun+'</td>' +
-                        '</tr>' +
-                    '</table></p>';
-                    if(settings.user){
-                        options.auth = {user:settings.user,pass:settings.password}
-                    }
-                    options.host = settings.host;
-                    if((settings.port)&&(settings.port!="")){
-                        options.port = parseInt(settings.port);
-                    }
-                    else{
-                        options.port = 25
-                    }
-                    var smtpTransport = nodemailer.createTransport("SMTP",options);
-                    var toList = "";
-                    execution.emails.forEach(function(email){
-                        if(toList == ""){
-                            toList = email
+                    _generateEmailReport(settings, execution, function(body) {
+                        if(settings.user){
+                            options.auth = {user:settings.user,pass:settings.password}
+                        }
+                        options.host = settings.host;
+                        if((settings.port)&&(settings.port!="")){
+                            options.port = parseInt(settings.port);
                         }
                         else{
-                            toList = toList + "," + email
+                            options.port = 25
                         }
-                    });
-                    var mailOptions = {
-                        from: "redwoodhq-no-reply@redwoodhq.com",
-                        to: toList,
-                        subject: subject,
-                        //text: "Hello world", // plaintext body
-                        html: body // html body
-                    };
+                        //console.log("sendNotification +8");
+                        var smtpTransport = nodemailer.createTransport("SMTP",options);
+                        var toList = "";
+                        execution.emails.forEach(function(email){
+                            if(toList == ""){
+                                toList = email
+                            }
+                            else{
+                                toList = toList + "," + email
+                            }
+                        });
+                        var mailOptions = {
+                            from: "redwoodhq-no-reply@wolterskluwer.com",
+                            to: toList,
+                            subject: subject,
+                            //text: "Hello world", // plaintext body
+                            html: body // html body
+                        };
 
-                    smtpTransport.sendMail(mailOptions, function(error, response){
-                        if(error){
-                            common.logger.info(error);
-                        }
+                        smtpTransport.sendMail(mailOptions, function(error, response){
+                            //console.log("sendNotification +9");
+                            if(error){
+                                common.logger.info(error);
+                                console.log(error);
+                               // console.log("sendNotification +10");
+                            }
 
-                        smtpTransport.close();
+                            smtpTransport.close();
+                        });
+                        //console.log("sendNotification end +100");
+                        console.log(body);
                     });
                 });
             });
@@ -2691,4 +3110,3 @@ function deleteDir(path,callback){
         }
     })
 }
-

@@ -1,4 +1,3 @@
-
 /**
  * Module dependencies.
  */
@@ -48,7 +47,10 @@ var express = require('express')
   , license = require('./routes/license')
   , actionHistory = require('./routes/actionHistory')
   , versionControl = require('./routes/versionControl')
-  , testcaseHistory = require('./routes/testcaseHistory');
+  , syncIDE = require('./routes/syncIDE')
+  , testcaseHistory = require('./routes/testcaseHistory')
+  , remoteexecution = require('./routes/remoteexecution');
+  //, elk = require('./routes/elk');
 
 var realFs = require("fs");
 var gracefulFs = require("graceful-fs");
@@ -86,6 +88,7 @@ process.env.TEMP = __dirname + '/logs';
   app.use(express.errorHandler());
 //});
 //DB
+require("fs").writeFileSync(__dirname+"/app.pid",process.pid);
 
 // Routes
 app.post('/login',auth.logIn,auth.logInSucess);
@@ -93,6 +96,11 @@ app.get('/login',auth.loginPage);
 
 app.post('/license',auth.auth,license.licensePost);
 app.get('/license',auth.auth,license.licenseGet);
+
+//sync to IDE
+app.post('/synctoide',auth.auth,syncIDE.syncToIDE);
+app.post('/synctoredwoodhq',auth.auth,syncIDE.syncToRedwoodHQ);
+app.post('/sourcesfromagent',syncIDE.sourcesFromAgent);
 
 //versioncontrol
 app.post('/versioncontrolhistory',auth.auth,versionControl.getLocalVersionHistory);
@@ -140,7 +148,9 @@ app.post('/record/recorded',recorder.recorded);
 
 //screenshots
 app.post('/screenshots',screenshots.Post);
-app.get('/screenshots/:id',auth.auth,screenshots.Get);
+//app.get('/screenshots/:id',auth.auth,screenshots.Get);
+app.get('/screenshots/:id',screenshots.Get);
+
 
 app.get('/',auth.auth, routes.index);
 app.get('/index.html',auth.auth,function(req,res){res.sendfile(__dirname+'/index.html');});
@@ -156,6 +166,12 @@ app.post('/variableTags',auth.auth, variableTags.variableTagsPost);
 
 //start execution
 app.post('/executionengine/startexecution', executionengine.startexecutionPost);
+//app.post('/elk/pushtoelk', elk.publishToElkPost);
+
+// remote execution
+app.get('/api/remoteexecution/startexecution', remoteexecution.startexecutionPost);
+app.get('/api/remoteexecution/verifyexecution', remoteexecution.verifyexecutionGet);
+// verify remote execution request
 
 //stop
 app.post('/executionengine/stopexecution',auth.auth, executionengine.stopexecutionPost);
@@ -196,6 +212,7 @@ app.get('/testcases',auth.auth, testcases.testcasesGet);
 app.put('/testcases/:id',auth.auth, testcases.testcasesPut);
 app.post('/testcases',auth.auth, testcases.testcasesPost);
 app.del('/testcases/:id',auth.auth, testcases.testcasesDelete);
+app.post('/testcasetocode',auth.auth, testcases.testCaseToCode);
 
 //testcaseTags
 app.get('/testcasetags',auth.auth, testcaseTags.testcaseTagsGet);
@@ -304,6 +321,7 @@ common.parseConfig(function(){
         common.cleanUpExecutions();
         common.cleanUpUserStatus(function(){
             var server = require('http').createServer(app);
+            server.setTimeout(parseInt(common.Config.DefaultTimeout));
             server.listen(common.Config.AppServerPort, function(){
               realtime.initSocket(server);
                common.logger.log("Express server listening on port %d in %s mode", common.Config.AppServerPort, app.settings.env);
